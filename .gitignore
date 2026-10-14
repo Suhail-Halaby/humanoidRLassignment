@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# project data
+data/raw/*
+!data/raw/.gitkeep
+*.mp4
+!data/samples/*.mp4
+checkpoints/
+*.pt

@@ -1,0 +1,10 @@
+mujoco<3.3
+robosuite==1.4.1
+bddl==1.0.1
+easydict
+hydra-core
+future
+cloudpickle
+gym==0.25.2
+torch
+libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git
