@@ -6,7 +6,8 @@ Pipeline for one clip:
     3. The pinch point (midway between thumb tip and index tip) is our stand-in for the robot gripper.
     4. A coloured object is found by colour thresholding.
     5. Everything is converted from pixels to table cm with the calibration from calib.py.
-    6. Grasp timing comes from the OBJECT: the hand is "closed" while the object is being carried.
+    6. Grasp timing from two signals: the OBJECT moving with the hand says whether and roughly when;
+       the FINGERS closing (thumb-index gap / hand size) pin down the exact close and open moments.
 
 Typical use:
     calib = calibrate_video(frames, layout)
@@ -194,13 +195,30 @@ def hsv_at(frame: np.ndarray, x: int, y: int, r: int = 5) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- 6. grasp timing
-def detect_grasp(obj_cm: np.ndarray, pinch_cm: np.ndarray, fps: float, move_cm: float = 2.0,
-                 near_cm: float = 6.0, pad_s: float = 0.25):
-    """Decide when the gripper is closed, from the object's motion. Assumes ONE pick-and-place per clip.
+# Two independent signals, each used for what it is good at:
+#   object carried  -> WHETHER a grasp happened and roughly when (hard to fool)
+#   fingers closed  -> EXACTLY when the fingers closed / opened (precise but noisy)
 
-    The object rests at a start position, gets carried, then rests at an end position.
-    A frame is 'carried' if the object is away from both rest positions AND close to the pinch point.
-    Why the padding: fingers close slightly before the object starts moving, and open slightly after it stops.
+def grip_ratio(lm_px: np.ndarray) -> np.ndarray:
+    """Thumb-index gap relative to hand size (the method from the original HandTrack notebook).
+    Why divide by hand size: the raw gap in pixels or cm changes with distance from the camera and
+    with hand height above the table; a ratio of two lengths on the same hand does not.
+
+    Inputs:
+        lm_px: np.ndarray (N,21,2) -- hand landmarks, pixels
+    Returns:
+        np.ndarray float64 (N,) -- |thumb tip - index tip| / |wrist - middle knuckle|; NaN where no hand
+    """
+    gap_px = np.linalg.norm(lm_px[:, THUMB_TIP] - lm_px[:, INDEX_TIP], axis=1)
+    hand_px = np.linalg.norm(lm_px[:, WRIST] - lm_px[:, MIDDLE_MCP], axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return gap_px / hand_px
+
+
+def object_carry(obj_cm: np.ndarray, pinch_cm: np.ndarray, fps: float, move_cm: float = 2.0,
+                 near_cm: float = 6.0) -> np.ndarray:
+    """Frames in which the object is being carried by the hand. Assumes ONE pick-and-place per clip:
+    the object rests at a start position, gets carried, then rests at an end position.
 
     Inputs:
         obj_cm:   np.ndarray (N,2) -- object position per frame, table cm (NaN where not seen)
@@ -208,18 +226,14 @@ def detect_grasp(obj_cm: np.ndarray, pinch_cm: np.ndarray, fps: float, move_cm: 
         fps:      float -- frame rate
         move_cm:  float -- distance from a rest position that counts as "moved", cm
         near_cm:  float -- max object-to-pinch distance that counts as "in the hand", cm
-        pad_s:    float -- close this long before the first carried frame / open this long after the last, s
     Returns:
-        (grasp, t_close, t_open):
-            grasp:   np.ndarray bool (N,) -- True = gripper closed
-            t_close: int or None -- first closed frame (None if nothing was carried)
-            t_open:  int or None -- last closed frame
+        np.ndarray bool (N,) -- True where the object is away from both rest positions AND near the
+        pinch point; all False if the object was seen in fewer than 2 frames
     """
     n = len(obj_cm)
     seen = np.flatnonzero(~np.isnan(obj_cm).any(axis=1))
-    none = (np.zeros(n, bool), None, None)
     if len(seen) < 2:
-        return none
+        return np.zeros(n, bool)
     half_s = max(int(fps * 0.5), 1)                          # frames in half a second
     # median, not mean: one bad detection can't drag the rest position off
     start = np.nanmedian(obj_cm[seen[:half_s]], axis=0)      # where it sat at the beginning
@@ -228,14 +242,108 @@ def detect_grasp(obj_cm: np.ndarray, pinch_cm: np.ndarray, fps: float, move_cm: 
         away = (np.linalg.norm(obj_cm - start, axis=1) > move_cm) & \
                (np.linalg.norm(obj_cm - end, axis=1) > move_cm)
         near = np.linalg.norm(obj_cm - pinch_cm, axis=1) < near_cm
-    carried = np.flatnonzero(away & near)
+    return away & near
+
+
+def finger_threshold(ratio: np.ndarray, carry: np.ndarray, min_contrast: float = 0.15) -> float:
+    """Grip-ratio value that separates "open" from "closed", set automatically for this clip.
+    Why automatic: "closed" around a can is a much bigger ratio than "closed" around a pen,
+    so a fixed number (like the old 0.5) can't work for every object.
+    Closed level = typical ratio while carrying; open level = 75th percentile outside the carry
+    (75th, not median: the hand is half-closed for part of the approach). Threshold = halfway.
+
+    Inputs:
+        ratio:        np.ndarray (N,) -- grip_ratio per frame
+        carry:        np.ndarray bool (N,) -- from object_carry
+        min_contrast: float -- if open and closed levels differ by less than this, the fingers
+                      don't show a clear grasp (e.g. thin object) and the signal is not trusted
+    Returns:
+        float -- threshold; NaN if the finger signal is unusable for this clip
+    """
+    closed = ratio[carry & ~np.isnan(ratio)]
+    opened = ratio[~carry & ~np.isnan(ratio)]
+    if len(closed) == 0 or len(opened) == 0:
+        return np.nan
+    closed_level = np.median(closed)
+    open_level = np.percentile(opened, 75)
+    if open_level - closed_level < min_contrast:
+        return np.nan
+    return float(0.5 * (open_level + closed_level))
+
+
+def _first_open(ratio: np.ndarray, thr: float, start: int, step: int, max_frames: int):
+    """Walk from frame `start` in direction `step` (-1 = back in time, +1 = forward) and return the
+    first frame where the fingers are open (ratio > thr).
+
+    Inputs:
+        ratio: np.ndarray (N,); thr: float; start: int frame; step: -1 or +1; max_frames: int
+    Returns:
+        int frame index, or None if not found within max_frames, or the hand is not visible on the way
+        (why give up on NaN: we would otherwise be guessing the timing)
+    """
+    for k in range(max_frames + 1):
+        j = start + step * k
+        if j < 0 or j >= len(ratio) or np.isnan(ratio[j]):
+            return None
+        if ratio[j] > thr:
+            return j
+    return None
+
+
+def detect_grasp(carry: np.ndarray, ratio: np.ndarray, fps: float, pad_s: float = 0.25,
+                 search_s: float = 1.0, min_contrast: float = 0.15) -> dict:
+    """Combine both signals into when the gripper is closed.
+
+    1. No carried frames -> no grasp (the finger signal alone is never enough: pinching air is not a grasp).
+    2. Close moment: search back from the first carried frame (up to search_s) for the last time the
+       fingers were open; the gripper closes on the frame after that.
+       Open moment: search forward from the last carried frame for the first time the fingers open.
+    3. Fallback for either moment, if the finger signal is unusable or the hand isn't visible there:
+       a fixed pad_s before / after the carry.
+
+    Inputs:
+        carry:        np.ndarray bool (N,) -- from object_carry
+        ratio:        np.ndarray (N,) -- from grip_ratio
+        fps:          float -- frame rate
+        pad_s:        float -- fallback margin, s
+        search_s:     float -- how far before / after the carry to look for the finger movement, s
+        min_contrast: float -- passed to finger_threshold
+    Returns:
+        dict with keys
+            "grasp":     np.ndarray bool (N,) -- True = gripper closed
+            "t_close":   int -- first closed frame (-1 if no grasp)
+            "t_open":    int -- last closed frame (-1 if no grasp)
+            "close_src": str -- "fingers", "padding" or "none": which signal set t_close
+            "open_src":  str -- same, for t_open
+            "threshold": float -- grip-ratio threshold (NaN if the finger signal was unusable)
+    """
+    n = len(carry)
+    out = {"grasp": np.zeros(n, bool), "t_close": -1, "t_open": -1,
+           "close_src": "none", "open_src": "none", "threshold": np.nan}
+    carried = np.flatnonzero(carry)
     if len(carried) == 0:
-        return none
+        return out
+    first, last = carried[0], carried[-1]
+    thr = finger_threshold(ratio, carry, min_contrast)
+    out["threshold"] = thr
+    search = int(round(search_s * fps))
     pad = int(round(pad_s * fps))
-    t_close, t_open = max(carried[0] - pad, 0), min(carried[-1] + pad, n - 1)
-    grasp = np.zeros(n, bool)
-    grasp[t_close:t_open + 1] = True
-    return grasp, int(t_close), int(t_open)
+
+    j = None if np.isnan(thr) else _first_open(ratio, thr, first, -1, search)
+    if j is not None:
+        # min(): if the fingers already look open at the first carried frame, don't close after the carry starts
+        out["t_close"], out["close_src"] = min(j + 1, first), "fingers"
+    else:
+        out["t_close"], out["close_src"] = max(first - pad, 0), "padding"
+
+    j = None if np.isnan(thr) else _first_open(ratio, thr, last, +1, search)
+    if j is not None:
+        out["t_open"], out["open_src"] = max(j - 1, last), "fingers"
+    else:
+        out["t_open"], out["open_src"] = min(last + pad, n - 1), "padding"
+
+    out["grasp"][out["t_close"]:out["t_open"] + 1] = True
+    return out
 
 
 # --------------------------------------------------------------------------- result container
@@ -244,30 +352,40 @@ class HandTrack:
     """Everything tracked in one clip of N frames.
 
     Fields:
-        fps:          float
-        landmarks_px: np.ndarray (N,21,2) -- cleaned hand landmarks, pixels
-        detected:     np.ndarray bool (N,) -- True where MediaPipe actually saw the hand (before gap filling)
-        pinch_px:     np.ndarray (N,2) -- pinch point, pixels
-        pinch_cm:     np.ndarray (N,2) -- pinch point, table cm (the gripper stand-in)
-        aperture_cm:  np.ndarray (N,) -- thumb-index distance, cm (cross-check for the grasp)
-        obj_px:       np.ndarray (N,2) -- object centre, pixels
-        obj_cm:       np.ndarray (N,2) -- object centre, table cm
-        grasp:        np.ndarray bool (N,) -- True = gripper should be closed
-        t_close:      int -- first closed frame, -1 if no grasp found
-                      (why -1 and not None: .npz files can't store None)
-        t_open:       int -- last closed frame, -1 if no grasp found
+        fps:           float
+        landmarks_px:  np.ndarray (N,21,2) -- cleaned hand landmarks, pixels
+        detected:      np.ndarray bool (N,) -- True where MediaPipe actually saw the hand (before gap filling)
+        pinch_px:      np.ndarray (N,2) -- pinch point, pixels
+        pinch_cm:      np.ndarray (N,2) -- pinch point, table cm (the gripper stand-in)
+        grip_ratio:    np.ndarray (N,) -- thumb-index gap / hand size (also usable as a gripper width later)
+        grip_thr:      float -- open/closed threshold for grip_ratio, NaN if the finger signal was unusable
+        finger_closed: np.ndarray bool (N,) -- grip_ratio below grip_thr (all False if grip_thr is NaN)
+        obj_px:        np.ndarray (N,2) -- object centre, pixels
+        obj_cm:        np.ndarray (N,2) -- object centre, table cm
+        carry:         np.ndarray bool (N,) -- object judged to be carried by the hand
+        grasp:         np.ndarray bool (N,) -- final answer: True = gripper should be closed
+        t_close:       int -- first closed frame, -1 if no grasp found
+                       (why -1 and not None: .npz files can't store None)
+        t_open:        int -- last closed frame, -1 if no grasp found
+        close_src:     str -- "fingers" / "padding" / "none": which signal decided t_close
+        open_src:      str -- same, for t_open
     """
     fps: float
     landmarks_px: np.ndarray
     detected: np.ndarray
     pinch_px: np.ndarray
     pinch_cm: np.ndarray
-    aperture_cm: np.ndarray
+    grip_ratio: np.ndarray
+    grip_thr: float
+    finger_closed: np.ndarray
     obj_px: np.ndarray
     obj_cm: np.ndarray
+    carry: np.ndarray
     grasp: np.ndarray
     t_close: int
     t_open: int
+    close_src: str
+    open_src: str
 
     def save(self, path: str) -> None:
         """Write all fields to one compressed .npz file.
@@ -288,17 +406,30 @@ class HandTrack:
         """
         d = np.load(path)
         kw = {f.name: d[f.name] for f in fields(cls)}
-        # .npz stores single numbers as 0-d arrays; turn them back into plain float/int
-        kw["fps"] = float(kw["fps"]); kw["t_close"] = int(kw["t_close"]); kw["t_open"] = int(kw["t_open"])
+        # .npz stores single values as 0-d arrays; turn them back into plain float/int/str
+        for k in ("fps", "grip_thr"):
+            kw[k] = float(kw[k])
+        for k in ("t_close", "t_open"):
+            kw[k] = int(kw[k])
+        for k in ("close_src", "open_src"):
+            kw[k] = str(kw[k])
         return cls(**kw)
 
     def summary(self) -> str:
-        """One-line health check: frames, % hand seen, % object seen, grasp frames."""
+        """One-line health check: frames, % hand / object seen, grasp frames, which signal set them,
+        and how far the measured finger movement was from the object's movement (ms)."""
         ok = ~np.isnan(self.pinch_cm[:, 0])
-        g = f"close@{self.t_close} open@{self.t_open}" if self.t_close >= 0 else "NO GRASP FOUND"
-        return (f"{len(self.detected)} frames | hand seen {self.detected.mean() * 100:.0f}% "
+        line = (f"{len(self.detected)} frames | hand seen {self.detected.mean() * 100:.0f}% "
                 f"(usable after gap-fill {ok.mean() * 100:.0f}%) | "
-                f"object seen {(~np.isnan(self.obj_cm[:, 0])).mean() * 100:.0f}% | {g}")
+                f"object seen {(~np.isnan(self.obj_cm[:, 0])).mean() * 100:.0f}% | ")
+        if self.t_close < 0:
+            return line + "NO GRASP FOUND"
+        carried = np.flatnonzero(self.carry)
+        lead_ms = (carried[0] - self.t_close) / self.fps * 1000     # fingers closed this long before object moved
+        lag_ms = (self.t_open - carried[-1]) / self.fps * 1000      # fingers opened this long after it stopped
+        return line + (f"close@{self.t_close} ({self.close_src}, {lead_ms:.0f}ms before carry) "
+                       f"open@{self.t_open} ({self.open_src}, {lag_ms:.0f}ms after) | "
+                       f"grip threshold {self.grip_thr:.2f}")
 
 
 # --------------------------------------------------------------------------- whole clip
@@ -326,9 +457,8 @@ def process_video(frames, fps: float, calib: Calibration, colour: str = "blue", 
 
     # pinch point = midway between thumb tip and index tip, where a held object sits
     pinch_px = 0.5 * (lm[:, THUMB_TIP] + lm[:, INDEX_TIP])
-    lm_cm = calib.to_table(lm)
     pinch_cm = calib.to_table(pinch_px)
-    aperture_cm = np.linalg.norm(lm_cm[:, THUMB_TIP] - lm_cm[:, INDEX_TIP], axis=1)
+    ratio = grip_ratio(lm)                     # in pixels on purpose: it's a ratio, so units cancel
 
     obj_px = smooth(track_object(frames, hsv_ranges or COLOURS[colour]), 3)
     obj_cm = calib.to_table(obj_px)
@@ -339,11 +469,15 @@ def process_video(frames, fps: float, calib: Calibration, colour: str = "blue", 
         obj_cm[off] = np.nan
         obj_px[off] = np.nan
 
-    grasp, t_close, t_open = detect_grasp(obj_cm, pinch_cm, fps)
+    carry = object_carry(obj_cm, pinch_cm, fps)
+    g = detect_grasp(carry, ratio, fps)
+    with np.errstate(invalid="ignore"):
+        finger_closed = ratio < g["threshold"]              # all False if threshold is NaN
     return HandTrack(fps=float(fps), landmarks_px=lm, detected=detected, pinch_px=pinch_px,
-                     pinch_cm=pinch_cm, aperture_cm=aperture_cm, obj_px=obj_px, obj_cm=obj_cm,
-                     grasp=grasp, t_close=-1 if t_close is None else t_close,
-                     t_open=-1 if t_open is None else t_open)
+                     pinch_cm=pinch_cm, grip_ratio=ratio, grip_thr=g["threshold"],
+                     finger_closed=finger_closed, obj_px=obj_px, obj_cm=obj_cm, carry=carry,
+                     grasp=g["grasp"], t_close=g["t_close"], t_open=g["t_open"],
+                     close_src=g["close_src"], open_src=g["open_src"])
 
 
 # --------------------------------------------------------------------------- visual checks
@@ -374,8 +508,9 @@ def draw_track(frame: np.ndarray, track: HandTrack, i: int) -> np.ndarray:
 
 
 def plot_track(track: HandTrack):
-    """Four stacked time plots: x and y (pinch vs object, cm), thumb-index aperture (cm),
-    and the hand-seen / grasp flags. The grasp period is shaded red.
+    """Four stacked time plots, grasp period shaded red on all of them:
+    x and y (pinch vs object, cm); grip ratio with its threshold; and the four on/off signals
+    (hand seen, object carried, fingers closed, final grasp) drawn as separate lanes.
 
     Inputs:
         track: HandTrack
@@ -384,14 +519,23 @@ def plot_track(track: HandTrack):
     """
     import matplotlib.pyplot as plt
     t = np.arange(len(track.grasp)) / track.fps
-    fig, ax = plt.subplots(4, 1, figsize=(9, 7), sharex=True)
+    fig, ax = plt.subplots(4, 1, figsize=(9, 8), sharex=True)
     ax[0].plot(t, track.pinch_cm[:, 0], label="pinch"); ax[0].plot(t, track.obj_cm[:, 0], "--", label="object")
     ax[0].set_ylabel("x (cm)"); ax[0].legend(loc="upper right")
     ax[1].plot(t, track.pinch_cm[:, 1]); ax[1].plot(t, track.obj_cm[:, 1], "--"); ax[1].set_ylabel("y (cm)")
-    ax[2].plot(t, track.aperture_cm); ax[2].set_ylabel("thumb-index\n(cm)")
-    ax[3].plot(t, track.detected, label="hand seen"); ax[3].plot(t, track.grasp, label="grasp")
-    ax[3].set_ylabel("flags"); ax[3].set_xlabel("time (s)"); ax[3].legend(loc="upper right")
-    for a in ax[:3]:
-        a.axvspan(*(t[[track.t_close, track.t_open]] if track.t_close >= 0 else (0, 0)), color="red", alpha=0.1)
+    ax[2].plot(t, track.grip_ratio, label="grip ratio")
+    if not np.isnan(track.grip_thr):
+        ax[2].axhline(track.grip_thr, ls="--", color="k", label="threshold")
+    ax[2].set_ylabel("thumb-index /\nhand size"); ax[2].legend(loc="upper right")
+    # each on/off signal gets its own lane (offset by 1.5) so they don't overlap
+    lanes = [("hand seen", track.detected), ("object carried", track.carry),
+             ("fingers closed", track.finger_closed), ("GRASP", track.grasp)]
+    for k, (name, sig) in enumerate(lanes):
+        ax[3].step(t, sig.astype(float) + 1.5 * k, where="post")
+    ax[3].set_yticks([1.5 * k + 0.5 for k in range(len(lanes))], [name for name, _ in lanes])
+    ax[3].set_xlabel("time (s)")
+    if track.t_close >= 0:
+        for a in ax:
+            a.axvspan(t[track.t_close], t[track.t_open], color="red", alpha=0.1)
     plt.tight_layout()
     return fig
