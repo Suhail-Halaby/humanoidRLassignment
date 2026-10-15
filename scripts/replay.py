@@ -32,6 +32,7 @@ def main():
     p.add_argument("--place", default="basket_1", help="sim object it is put into / onto")
     p.add_argument("--inits", default="0", help="comma-separated start layouts, e.g. 0,1,2,3,4")
     p.add_argument("--speed", type=float, default=1.0, help="1.0 = your speed, 0.5 = half speed")
+    p.add_argument("--settle", type=int, default=15, help="steps to wait for the fingers at each grasp / release")
     a = p.parse_args()
 
     import mediapy
@@ -56,7 +57,7 @@ def main():
                 print(f"  layout {init}: retarget FAILED: {e}")
                 rows.append((name, init, "retarget_failed"))
                 continue
-            obs, frames, ok = execute(env, plan, obs)
+            obs, frames, ok = execute(env, plan, obs, settle_steps=a.settle)
             print(f"  layout {init}: {'SUCCESS' if ok else 'fail'} | {plan.summary()}")
             rows.append((name, init, "success" if ok else "fail"))
             if n == 0:                       # one video per clip is enough to check by eye
