@@ -33,6 +33,8 @@ def main():
     p.add_argument("--inits", default="0", help="comma-separated start layouts, e.g. 0,1,2,3,4")
     p.add_argument("--speed", type=float, default=1.0, help="1.0 = your speed, 0.5 = half speed")
     p.add_argument("--settle", type=int, default=15, help="steps to wait for the fingers at each grasp / release")
+    p.add_argument("--clear", type=float, default=0.15, help="carry height above the object / target, m")
+    p.add_argument("--lift", type=float, default=0.0, help="lift straight up after the grasp, m (0 = off)")
     a = p.parse_args()
 
     import mediapy
@@ -52,7 +54,8 @@ def main():
         for n, init in enumerate(inits):
             obs = sim.reset(env, info["init_states"][init])
             try:
-                plan = retarget(track, sim.object_m(obs, a.object), sim.object_m(obs, a.place), speed=a.speed)
+                plan = retarget(track, sim.object_m(obs, a.object), sim.object_m(obs, a.place),
+                                speed=a.speed, clear_m=a.clear, lift_m=a.lift)
             except ValueError as e:
                 print(f"  layout {init}: retarget FAILED: {e}")
                 rows.append((name, init, "retarget_failed"))

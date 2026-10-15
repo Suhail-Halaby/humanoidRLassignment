@@ -47,6 +47,7 @@ class RobotPlan:
         scale:        float -- robot metres per sheet metre (1.0 = same size as your motion)
         rotation_deg: float -- how far the sheet was turned to line up with the robot's table
         dropped:      int   -- resampled steps skipped because the hand wasn't visible at that moment
+        lift_m:       float -- straight-up lift right after the grasp, before any sideways motion, m (0 = none)
     """
     target_m: np.ndarray
     grip: np.ndarray
@@ -56,6 +57,7 @@ class RobotPlan:
     scale: float
     rotation_deg: float
     dropped: int
+    lift_m: float = 0.0
 
     def summary(self) -> str:
         """One-line health check of the plan."""
@@ -121,7 +123,7 @@ def _ramp(dist_m: np.ndarray, low: float, high: float, ramp_m: float) -> np.ndar
 
 def height_profile(xy_m: np.ndarray, phase: np.ndarray, grasp_xy: np.ndarray, release_xy: np.ndarray,
                    z_grasp: float, z_hover: float, z_carry: float, z_release: float,
-                   ramp_m: float) -> np.ndarray:
+                   ramp_m: float, lift_m: float = 0.0) -> np.ndarray:
     """Rebuild the gripper height from where the hand is relative to the grasp and release points.
     Why distance-based and not time-based: the descent then happens exactly where your hand converged on
     the object, at your speed -- not at a fixed moment we would have to guess.
@@ -135,6 +137,8 @@ def height_profile(xy_m: np.ndarray, phase: np.ndarray, grasp_xy: np.ndarray, re
         z_carry:    float -- carrying height, high enough to clear the target, m
         z_release:  float -- height at which the fingers open over the target, m
         ramp_m:     float -- horizontal distance over which the gripper goes down / up, m
+        lift_m:     float -- while carrying, never go lower than this far above the grasp height, m
+                    (why: after a straight-up lift the path must not dip back down towards the table)
     Returns:
         np.ndarray (N,) -- height per step, m
     """
@@ -144,7 +148,7 @@ def height_profile(xy_m: np.ndarray, phase: np.ndarray, grasp_xy: np.ndarray, re
     before, carry, after = phase == 0, phase == 1, phase == 2
     z[before] = _ramp(d_grasp[before], z_grasp, z_hover, ramp_m)
     # while carrying: rise when leaving the object, sink when arriving at the target; lower of the two
-    z[carry] = np.minimum(_ramp(d_grasp[carry], z_grasp, z_carry, ramp_m),
+    z[carry] = np.minimum(_ramp(d_grasp[carry], min(z_grasp + lift_m, z_carry), z_carry, ramp_m),
                           _ramp(d_release[carry], z_release, z_carry, ramp_m))
     z[after] = _ramp(d_release[after], z_release, z_carry, ramp_m)
     return z
@@ -163,7 +167,7 @@ def _nearest_seen(xy: np.ndarray, i: int) -> int:
 
 def retarget(track: HandTrack, obj_m: np.ndarray, place_m: np.ndarray, hz: float = 20.0,
              speed: float = 1.0, hover_m: float = 0.10, clear_m: float = 0.15,
-             release_above_m: float = 0.10, ramp_m: float = 0.05) -> RobotPlan:
+             release_above_m: float = 0.10, ramp_m: float = 0.05, lift_m: float = 0.0) -> RobotPlan:
     """Turn one tracked clip into a robot gripper path for one simulator layout.
 
     Inputs:
@@ -176,6 +180,9 @@ def retarget(track: HandTrack, obj_m: np.ndarray, place_m: np.ndarray, hz: float
         clear_m:         float -- carry height above the higher of object / target, m
         release_above_m: float -- release height above the target position, m
         ramp_m:          float -- horizontal distance over which the gripper descends / rises, m
+        lift_m:          float -- lift straight up this far right after the grasp, before following your
+                         path sideways, m (0 = off). Why: a slow robot that moves sideways while still
+                         low drags the object along the table or knocks it over.
     Returns:
         RobotPlan
     Raises:
@@ -208,7 +215,7 @@ def retarget(track: HandTrack, obj_m: np.ndarray, place_m: np.ndarray, hz: float
     z_carry = max(obj_m[2], place_m[2]) + clear_m
     z_release = min(place_m[2] + release_above_m, z_carry)
     z = height_profile(xy, phase, obj_m[:2], place_m[:2], z_grasp, z_grasp + hover_m,
-                       z_carry, z_release, ramp_m)
+                       z_carry, z_release, ramp_m, lift_m)
 
     return RobotPlan(target_m=np.column_stack([xy, z]),
                      grip=np.where(phase == 1, 1.0, -1.0),
@@ -216,7 +223,7 @@ def retarget(track: HandTrack, obj_m: np.ndarray, place_m: np.ndarray, hz: float
                      grasp_m=np.array([obj_m[0], obj_m[1], z_grasp]),
                      release_m=np.array([place_m[0], place_m[1], z_release]),
                      scale=float(abs(k)), rotation_deg=float(np.degrees(np.angle(k))),
-                     dropped=dropped)
+                     dropped=dropped, lift_m=lift_m)
 
 
 # --------------------------------------------------------------------------- running it on the robot
@@ -252,6 +259,11 @@ def execute(env, plan: RobotPlan, obs: dict, settle_steps: int = 15, tail_steps:
             frames += f
             for _ in range(settle_steps):
                 step(np.array([0, 0, 0, 0, 0, 0, plan.grip[i]]))
+            if plan.grip[i] > 0 and plan.lift_m > 0:
+                # just grasped: lift straight up before following the path sideways
+                obs, f, _ = sim.go_to(env, plan.grasp_m + [0, 0, plan.lift_m], plan.grip[i], obs,
+                                      tol_m=0.01, max_steps=60)
+                frames += f
         step(sim.action_toward(sim.eef_m(obs), plan.target_m[i], plan.grip[i]))
     for _ in range(tail_steps):
         step(np.array([0, 0, 0, 0, 0, 0, plan.grip[-1]]))
