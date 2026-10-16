@@ -5,11 +5,20 @@ For each clip (.npz from track.py) and each chosen start layout:
     2. Retarget the hand path onto that layout (retarget.py).
     3. Drive the robot through it and ask LIBERO whether the task was completed.
 Saves one video per clip (first layout) and a results table (replay_results.csv).
+With --record, every successful replay is also saved as a SmolVLA training demo (see to_lerobot.py).
+
+Layouts: 0-24 are kept for testing SmolVLA (vla_benchmark.py), so record demos on 25-49 only.
 
 Run (Colab; PYTHONPATH because LIBERO's own install doesn't make it importable):
+    quick check, one layout:
     !PYTHONPATH=/content/LIBERO python scripts/replay.py \
         --tracks /content/drive/MyDrive/humanoid/processed --out /content/drive/MyDrive/humanoid/replay \
-        --object alphabet_soup_1 --place basket_1 --inits 0,1,2,3,4
+        --inits 25 --settle 30 --lift 0.10 --clear 0.25
+    record training demos:
+    !PYTHONPATH=/content/LIBERO python scripts/replay.py \
+        --tracks /content/drive/MyDrive/humanoid/processed --out /content/drive/MyDrive/humanoid/replay_rec \
+        --inits 25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49 \
+        --settle 30 --lift 0.10 --clear 0.25 --record /content/drive/MyDrive/humanoid/demos
 """
 import argparse
 import glob

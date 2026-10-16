@@ -227,8 +227,11 @@ def retarget(track: HandTrack, obj_m: np.ndarray, place_m: np.ndarray, hz: float
 
 
 # --------------------------------------------------------------------------- running it on the robot
-def execute(env, plan: RobotPlan, obs: dict, settle_steps: int = 15, tail_steps: int = 20):
+def execute(env, plan: RobotPlan, obs: dict, settle_steps: int = 15, tail_steps: int = 20,
+            record: bool = False):
     """Drive the simulated robot through a plan and report whether LIBERO counted the task as done.
+    With record=True it also keeps, for every step, exactly what SmolVLA sees and does
+    (camera images, 8-number robot state, 7-number action), so a successful run becomes a training demo.
 
     Inputs:
         env:          LIBERO env (from sim.make_env), already reset
@@ -236,35 +239,52 @@ def execute(env, plan: RobotPlan, obs: dict, settle_steps: int = 15, tail_steps:
         obs:          dict -- current observation
         settle_steps: int -- steps to wait for the fingers at each grasp / release
         tail_steps:   int -- steps to keep still at the end (lets a dropped object land)
+        record:       bool -- also return the per-step demo data
     Returns:
-        (obs, frames, success): last observation; list of uint8 (H,W,3) camera images;
-        bool -- True if LIBERO reported the task complete at any step
+        (obs, frames, success, demo):
+            obs:     last observation dict
+            frames:  list of uint8 (H,W,3) camera images, for the check video
+            success: bool -- True if LIBERO reported the task complete at any step
+            demo:    dict of np.ndarrays, one row per step (None if record=False):
+                     "image" (T,H,W,3) uint8 scene camera, "image2" (T,H,W,3) uint8 wrist camera,
+                     "state" (T,8) float32, "action" (T,7) float32
     """
     from . import sim
 
     frames, success = [], False
+    demo = {"image": [], "image2": [], "state": [], "action": []}
 
     def step(action):
-        # one simulator step; keep the image and remember if the task was ever completed
+        # one simulator step: note what the robot saw BEFORE acting and what it did, then act
         nonlocal obs, success
+        if record:
+            img, img2, state = sim.policy_inputs(obs)
+            demo["image"].append(img); demo["image2"].append(img2)
+            demo["state"].append(state); demo["action"].append(np.asarray(action, np.float32))
         obs, _, done, _ = env.step(action)
         frames.append(sim.camera(obs))
         success = success or bool(done)
 
+    def go_to(target_m, grip, tol_m=0.01, max_steps=60):
+        # same as sim.go_to, but every step goes through step() so it is recorded too
+        for _ in range(max_steps):
+            if np.linalg.norm(sim.eef_m(obs) - target_m) < tol_m:
+                return
+            step(sim.action_toward(sim.eef_m(obs), target_m, grip))
+
     for i in range(len(plan.target_m)):
         if i > 0 and plan.grip[i] != plan.grip[i - 1]:
             # grasp or release moment: reach the exact anchor point first, then let the fingers move
-            anchor = plan.grasp_m if plan.grip[i] > 0 else plan.release_m
-            obs, f, _ = sim.go_to(env, anchor, plan.grip[i - 1], obs, tol_m=0.01, max_steps=60)
-            frames += f
+            go_to(plan.grasp_m if plan.grip[i] > 0 else plan.release_m, plan.grip[i - 1])
             for _ in range(settle_steps):
                 step(np.array([0, 0, 0, 0, 0, 0, plan.grip[i]]))
             if plan.grip[i] > 0 and plan.lift_m > 0:
                 # just grasped: lift straight up before following the path sideways
-                obs, f, _ = sim.go_to(env, plan.grasp_m + [0, 0, plan.lift_m], plan.grip[i], obs,
-                                      tol_m=0.01, max_steps=60)
-                frames += f
+                go_to(plan.grasp_m + [0, 0, plan.lift_m], plan.grip[i])
         step(sim.action_toward(sim.eef_m(obs), plan.target_m[i], plan.grip[i]))
     for _ in range(tail_steps):
         step(np.array([0, 0, 0, 0, 0, 0, plan.grip[-1]]))
-    return obs, frames, success
+
+    if not record:
+        return obs, frames, success, None
+    return obs, frames, success, {k: np.stack(v) for k, v in demo.items()}

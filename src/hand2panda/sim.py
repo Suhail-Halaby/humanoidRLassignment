@@ -161,6 +161,39 @@ def camera(obs: dict, which: str = "agentview") -> np.ndarray:
     return np.ascontiguousarray(obs[key][::-1])
 
 
+def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
+    """Orientation as a quaternion (x, y, z, w) -> axis-angle (rotation axis scaled by the angle).
+    Why: SmolVLA's LIBERO state uses axis-angle, 3 numbers instead of the quaternion's 4.
+    Same formula as LeRobot's LiberoProcessorStep, so training data and evaluation agree.
+
+    Inputs:  quat: np.ndarray (4,) -- (x, y, z, w)
+    Returns: np.ndarray float32 (3,) -- axis * angle, radians
+    """
+    w = float(np.clip(quat[3], -1.0, 1.0))
+    den = np.sqrt(max(1.0 - w * w, 0.0))
+    if den < 1e-10:                              # no rotation: the axis is undefined, answer is zero
+        return np.zeros(3, np.float32)
+    return (np.asarray(quat[:3]) * 2.0 * np.arccos(w) / den).astype(np.float32)
+
+
+def policy_inputs(obs: dict):
+    """Exactly what SmolVLA receives in LIBERO, in the layout of its training dataset (HuggingFaceVLA/libero).
+    Why the 180-degree rotation (flip both axes): LeRobot's LIBERO evaluation rotates the raw MuJoCo images
+    by 180 degrees before the policy sees them, so training images must be stored the same way.
+
+    Inputs:  obs: dict -- LIBERO observation (env created with img_px=256 to match the dataset's 256x256)
+    Returns: (image, image2, state):
+                 image:  np.ndarray uint8 (H,W,3) -- scene camera, rotated 180 degrees
+                 image2: np.ndarray uint8 (H,W,3) -- wrist camera, rotated 180 degrees
+                 state:  np.ndarray float32 (8,) -- gripper position (3), axis-angle (3), finger joints (2)
+    """
+    image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+    image2 = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+    state = np.concatenate([obs["robot0_eef_pos"], quat_to_axis_angle(obs["robot0_eef_quat"]),
+                            obs["robot0_gripper_qpos"]]).astype(np.float32)
+    return image, image2, state
+
+
 def print_obs(obs: dict) -> None:
     """Print every observation key with its shape, and the objects in the scene with their positions.
     Why: object names differ per task; this is how you find out what to pass to object_m.

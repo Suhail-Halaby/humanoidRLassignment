@@ -7,4 +7,5 @@ future
 cloudpickle
 gym==0.25.2
 torch
-libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git
+# LIBERO itself: clone it and `pip install -e` it, and run scripts with PYTHONPATH=<LIBERO folder>.
+# Why not listed here: its task files live inside the cloned folder.
