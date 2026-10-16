@@ -22,6 +22,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--demos", required=True, help="folder with the .npz demos from replay.py --record")
     p.add_argument("--out", required=True, help="dataset folder to create (must not exist yet)")
+    p.add_argument("--episodes", type=int, default=25, help="test episodes = layouts 0..episodes-1")
     p.add_argument("--repo-id", default="local/hand2panda", help="dataset name (only used as a label)")
     a = p.parse_args()
 
