@@ -44,6 +44,8 @@ def main():
     p.add_argument("--settle", type=int, default=15, help="steps to wait for the fingers at each grasp / release")
     p.add_argument("--clear", type=float, default=0.15, help="carry height above the object / target, m")
     p.add_argument("--lift", type=float, default=0.0, help="lift straight up after the grasp, m (0 = off)")
+    p.add_argument("--release-above", type=float, default=0.10, help="release height above the target position, m")
+    p.add_argument("--ramp", type=float, default=0.05, help="horizontal distance over which the gripper descends, m")
     p.add_argument("--record", default=None,
                    help="folder: save every SUCCESSFUL replay as a training demo (.npz) for to_lerobot.py")
     a = p.parse_args()
@@ -66,7 +68,8 @@ def main():
             obs = sim.reset(env, info["init_states"][init])
             try:
                 plan = retarget(track, sim.object_m(obs, a.object), sim.object_m(obs, a.place),
-                                speed=a.speed, clear_m=a.clear, lift_m=a.lift)
+                                speed=a.speed, clear_m=a.clear, lift_m=a.lift,
+                                release_above_m=a.release_above, ramp_m=a.ramp)
             except ValueError as e:
                 print(f"  layout {init}: retarget FAILED: {e}")
                 rows.append((name, init, "retarget_failed"))
