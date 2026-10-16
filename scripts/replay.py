@@ -35,6 +35,8 @@ def main():
     p.add_argument("--settle", type=int, default=15, help="steps to wait for the fingers at each grasp / release")
     p.add_argument("--clear", type=float, default=0.15, help="carry height above the object / target, m")
     p.add_argument("--lift", type=float, default=0.0, help="lift straight up after the grasp, m (0 = off)")
+    p.add_argument("--record", default=None,
+                   help="folder: save every SUCCESSFUL replay as a training demo (.npz) for to_lerobot.py")
     a = p.parse_args()
 
     import mediapy
@@ -60,9 +62,14 @@ def main():
                 print(f"  layout {init}: retarget FAILED: {e}")
                 rows.append((name, init, "retarget_failed"))
                 continue
-            obs, frames, ok = execute(env, plan, obs, settle_steps=a.settle)
+            obs, frames, ok, demo = execute(env, plan, obs, settle_steps=a.settle, record=a.record is not None)
             print(f"  layout {init}: {'SUCCESS' if ok else 'fail'} | {plan.summary()}")
             rows.append((name, init, "success" if ok else "fail"))
+            if ok and a.record:
+                # only successes become training data: a failed demo would teach the policy to fail
+                os.makedirs(a.record, exist_ok=True)
+                np.savez_compressed(os.path.join(a.record, f"{name}_layout{init}.npz"),
+                                    task=info["language"], **demo)
             if n == 0:                       # one video per clip is enough to check by eye
                 mediapy.write_video(os.path.join(a.out, f"{name}_layout{init}.mp4"), frames, fps=sim.CONTROL_HZ)
 
